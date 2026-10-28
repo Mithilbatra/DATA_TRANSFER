@@ -1,0 +1,14 @@
+{
+  "name": "data-transfer",
+  "version": "1.0.0",
+  "description": "Share files between laptops on the same network with a 6-digit code",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
