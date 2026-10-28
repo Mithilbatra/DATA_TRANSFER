@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Transfer</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f5f6f8; --card: #fff; --fg: #1b1f24; --muted: #59626c; --line: #d6dbe1; --accent: #1f5fd6; --on-accent: #fff; --err: #b42318; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #111418; --card: #1a1e24; --fg: #e8eaed; --muted: #a0a9b3; --line: #2e353e; --accent: #7aa7ff; --on-accent: #0b1020; --err: #ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px; display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); align-items: start; }
+  h1 { grid-column: 1 / -1; margin: 0; font-size: 1.5rem; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; min-width: 0; }
+  h2 { margin: 0 0 12px; font-size: 1.15rem; }
+  .drop { display: block; position: relative; border: 2px dashed var(--line); border-radius: 10px; padding: 36px 16px; text-align: center; cursor: pointer; color: var(--muted); }
+  .drop.over, .drop:focus-within { border-color: var(--accent); color: var(--fg); }
+  .drop input { position: absolute; width: 1px; height: 1px; opacity: 0; } /* tiny, so drops land on the box, not the input */
+  .code { font: 700 2.4rem/1.2 ui-monospace, monospace; letter-spacing: .2em; margin: 16px 0 4px; }
+  .muted { color: var(--muted); font-size: .9rem; margin: 0; }
+  ul { list-style: none; padding: 0; margin: 12px 0; }
+  li { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+  form { display: grid; gap: 8px; }
+  input[type=text] { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: inherit; width: 100%; }
+  #rcode { font-family: ui-monospace, monospace; letter-spacing: .15em; }
+  button { font: inherit; padding: 8px 16px; border: 0; border-radius: 8px; background: var(--accent); color: var(--on-accent); cursor: pointer; justify-self: start; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  a { color: var(--accent); }
+  [role=status]:empty { display: none; }
+  [role=status] { margin: 12px 0 0; }
+  .err { color: var(--err); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Data Transfer</h1>
+
+  <section aria-labelledby="send-h">
+    <h2 id="send-h">Send</h2>
+    <label class="drop" id="drop"><input type="file" id="pick" multiple>Drop files here, or click to choose</label>
+    <div id="share" hidden>
+      <p class="code" id="code"></p>
+      <p class="muted">Type this code in <b>Receive</b> on the other laptop. It expires in 15 minutes.</p>
+      <p class="muted">This laptop's address: <span id="addr"></span></p>
+    </div>
+    <ul id="sent"></ul>
+    <p id="send-msg" role="status"></p>
+  </section>
+
+  <section aria-labelledby="recv-h">
+    <h2 id="recv-h">Receive</h2>
+    <form id="find">
+      <label for="rcode">Code</label>
+      <input type="text" id="rcode" inputmode="numeric" pattern="\d{6}" maxlength="6" autocomplete="off" required title="6 digits">
+      <details>
+        <summary class="muted">Sender not found?</summary>
+        <label for="host">Sender's address (shown under its code)</label>
+        <input type="text" id="host" placeholder="192.168.1.5:3000" autocomplete="off">
+      </details>
+      <button>Find files</button>
+    </form>
+    <p id="recv-msg" role="status"></p>
+    <div id="result" hidden>
+      <label><input type="checkbox" id="all" checked> Select all</label>
+      <ul id="files"></ul>
+      <button id="get" type="button">Download selected</button>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const size = n => { const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return (i ? n.toFixed(1) : n) + ' ' + u[i]; };
+const say = (el, text, err) => { el.textContent = text; el.classList.toggle('err', !!err); };
+
+// --- Send ---
+let code;
+async function put(f) {
+  if (!code) {
+    const r = await fetch('/api/share', { method: 'POST' }), s = await r.json();
+    if (!r.ok) throw new Error(s.error);
+    code = s.code;
+    $('code').textContent = code;
+    $('addr').textContent = s.addrs.join(', ') || 'not on a network';
+    $('sent').replaceChildren();
+    $('share').hidden = false;
+    const mine = code; // the server deletes the share after 15 minutes, so stop showing its code then
+    setTimeout(() => {
+      if (code !== mine) return;
+      code = null;
+      $('share').hidden = true;
+      $('sent').replaceChildren();
+      say($('send-msg'), 'Your code expired. Drop files again for a new one.', true);
+    }, 15 * 60e3);
+  }
+  return fetch(`/api/share/${code}?name=${encodeURIComponent(f.name)}`, { method: 'PUT', body: f });
+}
+async function share(files) {
+  const failed = [];
+  for (const f of files) {
+    say($('send-msg'), `Adding ${f.name}…`);
+    try {
+      let r = await put(f);
+      if (r.status === 404) { code = null; r = await put(f); } // share expired: start a new one
+      if (!r.ok) throw new Error((await r.json()).error);
+    } catch (e) { failed.push(`${f.name} (${e.message})`); continue; }
+    const li = document.createElement('li');
+    li.textContent = `${f.name} (${size(f.size)})`;
+    $('sent').append(li);
+  }
+  say($('send-msg'), failed.length ? 'Could not add: ' + failed.join(', ') : '', true);
+}
+const drop = $('drop');
+addEventListener('dragover', e => e.preventDefault()); // a drop outside the box must not open the file
+addEventListener('drop', e => e.preventDefault());
+drop.ondragover = () => drop.classList.add('over');
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => { drop.classList.remove('over'); share([...e.dataTransfer.files]); };
+$('pick').onchange = e => { share([...e.target.files]); e.target.value = ''; };
+
+// --- Receive ---
+$('find').onsubmit = async e => {
+  e.preventDefault();
+  const rc = $('rcode').value, host = $('host').value.trim();
+  $('result').hidden = true;
+  say($('recv-msg'), 'Looking for the sender…');
+  try {
+    const r = await fetch(`/api/find/${rc}` + (host ? `?host=${encodeURIComponent(host)}` : ''));
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    $('files').replaceChildren(...d.files.map(f => {
+      const li = document.createElement('li'), cb = document.createElement('input'), a = document.createElement('a');
+      cb.type = 'checkbox';
+      cb.checked = true;
+      cb.setAttribute('aria-label', 'Select ' + f.name);
+      a.href = `http://${d.host}/dl/${rc}/${f.i}`;
+      a.textContent = f.name;
+      li.append(cb, a, ` (${size(f.size)})`);
+      return li;
+    }));
+    $('all').checked = true;
+    say($('recv-msg'), d.files.length ? `${d.files.length} file(s) from ${d.host}` : 'Found the sender, but no files have been added yet.');
+    $('result').hidden = !d.files.length;
+  } catch (err) { say($('recv-msg'), err.message, true); }
+};
+$('all').onchange = e => $('files').querySelectorAll('input').forEach(cb => cb.checked = e.target.checked);
+$('get').onclick = () => {
+  const links = [...$('files').querySelectorAll('li')].filter(li => li.querySelector('input').checked).map(li => li.querySelector('a'));
+  links.forEach((a, k) => setTimeout(() => a.click(), k * 400)); // spaced out so the browser doesn't drop any
+};
+</script>
+</body>
+</html>

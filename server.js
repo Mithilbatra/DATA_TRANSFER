@@ -15,7 +15,7 @@ const shares = new Map(); // code -> { dir, n, files: [{ name, size, file }] }
 const fails = new Map(); // ip -> { n, t }: wrong codes per minute
 
 process.on('exit', () => fs.rmSync(ROOT, { recursive: true, force: true }));
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit());
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => process.exit());
 
 const lan = () => Object.values(os.networkInterfaces()).flat().filter(i => i.family === 'IPv4' && !i.internal);
 
@@ -24,7 +24,7 @@ function send(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-const blocked = ip => { const f = fails.get(ip); return f && Date.now() - f.t < 60e3 && f.n >= 5; };
+const blocked = (key, max = 5) => { const f = fails.get(key); return f && Date.now() - f.t < 60e3 && f.n >= max; };
 function fail(ip) {
   const f = fails.get(ip);
   if (!f || Date.now() - f.t >= 60e3) fails.set(ip, { n: 1, t: Date.now() });
@@ -35,9 +35,10 @@ setInterval(() => { for (const [ip, f] of fails) if (Date.now() - f.t >= 60e3) f
 // The share for a code typed by someone on the network, or undefined after sending the error.
 function lookup(req, res, code) {
   const ip = req.socket.remoteAddress;
-  if (blocked(ip)) return send(res, 429, { error: 'Too many wrong codes, wait a minute' });
+  // '*' caps guesses from all addresses together: one device can hold many IPv6 addresses
+  if (blocked(ip) || blocked('*', 20)) return send(res, 429, { error: 'Too many wrong codes, wait a minute' });
   const s = shares.get(code);
-  if (!s) { fail(ip); return send(res, 404, { error: 'No share with that code' }); }
+  if (!s) { fail(ip); fail('*'); return send(res, 404, { error: 'No share with that code' }); }
   return s;
 }
 
@@ -114,6 +115,7 @@ const server = http.createServer(async (req, res) => {
       const s = shares.get(m[1]);
       if (!s) return send(res, 404, { error: 'Share expired' });
       // stored under a number, so the name can't reach the disk path
+      // shortcut: the browser can't hand over a file path, so each file is copied (needs free space equal to its size); upgrade to a desktop app if that matters
       const file = path.join(s.dir, String(s.n++));
       const name = path.basename(searchParams.get('name') || '') || 'file';
       const out = fs.createWriteStream(file);
@@ -160,6 +162,10 @@ udp.on('message', (msg, r) => { if (String(msg) === 'FIND') udp.send(`HERE ${POR
 udp.on('error', e => console.error('Discovery off (receivers must type this computer\'s address):', e.message));
 udp.bind(UDP_PORT);
 
+server.on('error', e => {
+  console.error(e.code === 'EADDRINUSE' ? `Port ${PORT} is busy. Try: PORT=4000 node server.js` : e.message);
+  process.exit(1);
+});
 server.listen(PORT, () => {
   console.log(`Data Transfer running. Open http://localhost:${PORT}`);
   console.log(`Address on the network: ${lan().map(i => `${i.address}:${PORT}`).join(', ') || 'none found'}`);
