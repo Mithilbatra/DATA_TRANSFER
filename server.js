@@ -1,4 +1,4 @@
-// Data Transfer: share files on the local network with a 6-digit code. No dependencies.
+// Data Transfer: share files on the local network with a short code. No dependencies.
 const http = require('http');
 const dgram = require('dgram');
 const fs = require('fs');
@@ -8,16 +8,31 @@ const crypto = require('crypto');
 const { pipeline } = require('stream');
 
 const PORT = +process.env.PORT || 3000;
-const UDP_PORT = +process.env.UDP_PORT || 41234;
 const TTL = +process.env.TTL_MS || 15 * 60e3; // since the last upload
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'data-transfer-'));
-const shares = new Map(); // code -> { dir, n, busy, timer, files: [{ name, size, file }] }
+const shares = new Map(); // 6-digit secret (end of the code) -> { dir, n, busy, timer, files: [{ name, size, file }] }
 const fails = new Map(); // ip -> { n, t }: wrong codes per minute
 
 process.on('exit', () => fs.rmSync(ROOT, { recursive: true, force: true }));
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => process.exit());
 
-const lan = () => Object.values(os.networkInterfaces()).flat().filter(i => i.family === 'IPv4' && !i.internal);
+const ipv4 = () => Object.values(os.networkInterfaces()).flat().filter(i => i.family === 'IPv4');
+const lan = () => ipv4().filter(i => !i.internal);
+const nets = () => lan().length ? lan() : ipv4(); // loopback only when offline, so one laptop alone still works
+const toInt = ip => ip.split('.').reduce((n, b) => n * 256 + +b, 0);
+const toIp = n => [3, 2, 1, 0].map(k => Math.floor(n / 256 ** k) % 256).join('.');
+const span = i => 2 ** 32 - toInt(i.netmask); // how many addresses that network has
+
+// This laptop's networks, the one its default route uses first (so Wi-Fi beats Docker or VM networks).
+// Connecting a UDP socket only asks the OS for the route; it sends nothing.
+const myNets = () => new Promise(resolve => {
+  const s = dgram.createSocket('udp4');
+  s.connect(9, '1.1.1.1', err => {
+    const ip = err ? null : s.address().address;
+    s.close();
+    resolve(nets().sort((a, b) => (b.address === ip) - (a.address === ip)));
+  });
+});
 
 function send(res, status, body) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -58,42 +73,21 @@ function drop(code) {
 // RFC 5987 filename*, so any name (unicode, quotes) survives the header
 const encodeName = name => encodeURIComponent(name).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
-// Ask every copy of this app on the LAN for its HTTP address. The code never goes over UDP.
-function discover() {
-  const self = new Set(['127.0.0.1', ...lan().map(i => i.address)]);
-  const targets = ['255.255.255.255', '127.0.0.1', ...lan().map(i => {
-    const mask = i.netmask.split('.');
-    return i.address.split('.').map((b, k) => (b | ~mask[k]) & 255).join('.');
-  })];
-  return new Promise(resolve => {
-    const s = dgram.createSocket('udp4'), hosts = new Set();
-    s.on('error', () => {});
-    s.on('message', (msg, r) => {
-      const m = /^HERE (\d+)$/.exec(String(msg));
-      // this machine answers on several addresses; count it once
-      if (m) hosts.add(self.has(r.address) && +m[1] === PORT ? `127.0.0.1:${PORT}` : `${r.address}:${m[1]}`);
-    });
-    s.bind(() => {
-      s.setBroadcast(true);
-      for (const a of targets) s.send('FIND', UDP_PORT, a, () => {});
-    });
-    setTimeout(() => { s.close(); resolve([...hosts]); }, 800);
-  });
-}
-
-async function find(code, host) {
+// The code starts with the sender's place in the network (42 for 192.168.1.42 on home Wi-Fi). Only that
+// address is asked, never the whole network: on the main network first, others only if nobody answers there.
+async function find(prefix, secret, host) {
   if (host && !/^[\w.-]+(:\d+)?$/.test(host)) return [400, { error: 'Sender address looks like 192.168.1.5:3000' }];
   if (host && !host.includes(':')) host += ':' + PORT;
-  const hosts = host ? [host] : await discover();
-  const results = await Promise.all(hosts.map(h =>
-    fetch(`http://${h}/share/${code}`, { signal: AbortSignal.timeout(3000), redirect: 'error' }) // a fake sender must not bounce us elsewhere
-      .then(async r => ({ h, status: r.status, body: await r.json() }))
-      .catch(() => null)));
-  const hit = results.find(r => r && r.status === 200);
-  if (hit) return [200, { host: hit.h, files: hit.body }];
-  const locked = results.find(r => r && r.status === 429);
-  if (locked) return [429, locked.body];
-  return [404, { error: results.some(Boolean) ? 'No share with that code' : 'No sender found. Enter the sender address shown on the other laptop.' }];
+  const hosts = host ? [host] : (await myNets()).filter(i => prefix < span(i))
+    .map(i => `${toIp(toInt(i.address) - toInt(i.address) % span(i) + prefix)}:${PORT}`);
+  for (const h of hosts) {
+    const r = await fetch(`http://${h}/share/${secret}`, { signal: AbortSignal.timeout(3000), redirect: 'error' }).catch(() => null);
+    if (!r) continue; // nobody there: try this laptop's next network
+    const body = await r.json().catch(() => null);
+    if (r.ok && Array.isArray(body)) return [200, { host: h, files: body }];
+    return [r.ok ? 502 : r.status, body?.error ? body : { error: `${h} isn't running Data Transfer` }];
+  }
+  return [404, { error: 'No sender found. Check the code, or open "Sender not found?" and enter the address shown on the other laptop.' }];
 }
 
 const server = http.createServer(async (req, res) => {
@@ -117,7 +111,8 @@ const server = http.createServer(async (req, res) => {
       fs.mkdirSync(dir);
       shares.set(code, { dir, n: 0, busy: 0, files: [] });
       touch(code);
-      return send(res, 200, { code, addrs: lan().map(i => `${i.address}:${PORT}`) });
+      const [i] = await myNets();
+      return send(res, 200, { code: `${toInt(i.address) % span(i)}-${code}`, addrs: lan().map(i => `${i.address}:${PORT}`) });
     }
 
     if (req.method === 'PUT' && (m = /^\/api\/share\/(\d{6})$/.exec(pathname))) {
@@ -139,8 +134,8 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (req.method === 'GET' && (m = /^\/api\/find\/(\d{6})$/.exec(pathname))) {
-      const [status, body] = await find(m[1], searchParams.get('host')?.trim());
+    if (req.method === 'GET' && (m = /^\/api\/find\/(\d{1,10})(\d{6})$/.exec(pathname))) { // code digits, dash removed
+      const [status, body] = await find(+m[1], m[2], searchParams.get('host')?.trim());
       return send(res, status, body);
     }
 
@@ -168,12 +163,6 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) send(res, 500, { error: 'Server error' });
   }
 });
-
-// Answer "FIND" broadcasts so receivers can locate this computer
-const udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-udp.on('message', (msg, r) => { if (String(msg) === 'FIND') udp.send(`HERE ${PORT}`, r.port, r.address, () => {}); });
-udp.on('error', e => console.error('Discovery off (receivers must type this computer\'s address):', e.message));
-udp.bind(UDP_PORT);
 
 server.requestTimeout = 0; // big files can take longer than Node's 5-minute default to upload
 server.on('error', e => {
