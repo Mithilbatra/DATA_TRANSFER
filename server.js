@@ -9,9 +9,9 @@ const { pipeline } = require('stream');
 
 const PORT = +process.env.PORT || 3000;
 const UDP_PORT = +process.env.UDP_PORT || 41234;
-const TTL = 15 * 60e3;
+const TTL = +process.env.TTL_MS || 15 * 60e3; // since the last upload
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'data-transfer-'));
-const shares = new Map(); // code -> { dir, n, files: [{ name, size, file }] }
+const shares = new Map(); // code -> { dir, n, busy, timer, files: [{ name, size, file }] }
 const fails = new Map(); // ip -> { n, t }: wrong codes per minute
 
 process.on('exit', () => fs.rmSync(ROOT, { recursive: true, force: true }));
@@ -42,8 +42,16 @@ function lookup(req, res, code) {
   return s;
 }
 
+function touch(code) {
+  const s = shares.get(code);
+  clearTimeout(s.timer);
+  s.timer = setTimeout(() => drop(code), TTL);
+}
+
 function drop(code) {
-  try { fs.rmSync(shares.get(code).dir, { recursive: true, force: true }); } catch {} // a file may still be open on Windows
+  const s = shares.get(code);
+  if (s.busy) return touch(code); // never delete a share while a file is still arriving
+  try { fs.rmSync(s.dir, { recursive: true, force: true }); } catch {} // a file may still be open on Windows
   shares.delete(code);
 }
 
@@ -78,7 +86,7 @@ async function find(code, host) {
   if (host && !host.includes(':')) host += ':' + PORT;
   const hosts = host ? [host] : await discover();
   const results = await Promise.all(hosts.map(h =>
-    fetch(`http://${h}/share/${code}`, { signal: AbortSignal.timeout(3000) })
+    fetch(`http://${h}/share/${code}`, { signal: AbortSignal.timeout(3000), redirect: 'error' }) // a fake sender must not bounce us elsewhere
       .then(async r => ({ h, status: r.status, body: await r.json() }))
       .catch(() => null)));
   const hit = results.find(r => r && r.status === 200);
@@ -90,9 +98,10 @@ async function find(code, host) {
 
 const server = http.createServer(async (req, res) => {
   const { pathname, searchParams } = new URL(req.url, 'http://x');
-  // /api is the UI's own backend: this computer only, and not via a rebinding hostname
+  // /api is the UI's own backend: this computer only, not via a rebinding hostname, not from other sites' pages
   const local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress)
-    && /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(req.headers.host || '');
+    && /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(req.headers.host || '')
+    && [undefined, 'same-origin'].includes(req.headers['sec-fetch-site']);
   let m;
   try {
     if (req.method === 'GET' && pathname === '/') {
@@ -106,8 +115,8 @@ const server = http.createServer(async (req, res) => {
       do code = String(crypto.randomInt(1e6)).padStart(6, '0'); while (shares.has(code));
       const dir = path.join(ROOT, code);
       fs.mkdirSync(dir);
-      shares.set(code, { dir, n: 0, files: [] });
-      setTimeout(() => drop(code), TTL);
+      shares.set(code, { dir, n: 0, busy: 0, files: [] });
+      touch(code);
       return send(res, 200, { code, addrs: lan().map(i => `${i.address}:${PORT}`) });
     }
 
@@ -119,7 +128,11 @@ const server = http.createServer(async (req, res) => {
       const file = path.join(s.dir, String(s.n++));
       const name = path.basename(searchParams.get('name') || '') || 'file';
       const out = fs.createWriteStream(file);
+      const code = m[1];
+      s.busy++;
       return pipeline(req, out, err => {
+        s.busy--;
+        touch(code);
         if (err) { fs.rm(file, { force: true }, () => {}); return send(res, 500, { error: 'Upload failed' }); }
         s.files.push({ name, size: out.bytesWritten, file });
         send(res, 200, { ok: true });
@@ -162,6 +175,7 @@ udp.on('message', (msg, r) => { if (String(msg) === 'FIND') udp.send(`HERE ${POR
 udp.on('error', e => console.error('Discovery off (receivers must type this computer\'s address):', e.message));
 udp.bind(UDP_PORT);
 
+server.requestTimeout = 0; // big files can take longer than Node's 5-minute default to upload
 server.on('error', e => {
   console.error(e.code === 'EADDRINUSE' ? `Port ${PORT} is busy. Try: PORT=4000 node server.js` : e.message);
   process.exit(1);

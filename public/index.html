@@ -76,7 +76,17 @@ const size = n => { const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; while (n
 const say = (el, text, err) => { el.textContent = text; el.classList.toggle('err', !!err); };
 
 // --- Send ---
-let code;
+let code, expiry;
+// the server deletes a share 15 minutes after its last upload, so stop showing the code then
+function armExpiry() {
+  clearTimeout(expiry);
+  expiry = setTimeout(() => {
+    code = null;
+    $('share').hidden = true;
+    $('sent').replaceChildren();
+    say($('send-msg'), 'Your code expired. Drop files again for a new one.', true);
+  }, 15 * 60e3);
+}
 async function put(f) {
   if (!code) {
     const r = await fetch('/api/share', { method: 'POST' }), s = await r.json();
@@ -86,14 +96,7 @@ async function put(f) {
     $('addr').textContent = s.addrs.join(', ') || 'not on a network';
     $('sent').replaceChildren();
     $('share').hidden = false;
-    const mine = code; // the server deletes the share after 15 minutes, so stop showing its code then
-    setTimeout(() => {
-      if (code !== mine) return;
-      code = null;
-      $('share').hidden = true;
-      $('sent').replaceChildren();
-      say($('send-msg'), 'Your code expired. Drop files again for a new one.', true);
-    }, 15 * 60e3);
+    armExpiry();
   }
   return fetch(`/api/share/${code}?name=${encodeURIComponent(f.name)}`, { method: 'PUT', body: f });
 }
@@ -101,11 +104,13 @@ async function share(files) {
   const failed = [];
   for (const f of files) {
     say($('send-msg'), `Adding ${f.name}…`);
+    clearTimeout(expiry); // the server never expires a share mid-upload, so neither does the page
     try {
       let r = await put(f);
       if (r.status === 404) { code = null; r = await put(f); } // share expired: start a new one
       if (!r.ok) throw new Error((await r.json()).error);
     } catch (e) { failed.push(`${f.name} (${e.message})`); continue; }
+    armExpiry();
     const li = document.createElement('li');
     li.textContent = `${f.name} (${size(f.size)})`;
     $('sent').append(li);
