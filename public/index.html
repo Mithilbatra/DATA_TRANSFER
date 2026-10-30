@@ -42,7 +42,7 @@
     <label class="drop" id="drop"><input type="file" id="pick" multiple>Drop files here, or click to choose</label>
     <div id="share" hidden>
       <p class="code" id="code"></p>
-      <p class="muted">Type this code in <b>Receive</b> on the other laptop. It expires in 15 minutes.</p>
+      <p class="muted">Type this code in <b>Receive</b> on the other laptop. It expires 15 minutes after the last file is added.</p>
       <p class="muted">This laptop's address: <span id="addr"></span></p>
     </div>
     <ul id="sent"></ul>
@@ -53,7 +53,7 @@
     <h2 id="recv-h">Receive</h2>
     <form id="find">
       <label for="rcode">Code</label>
-      <input type="text" id="rcode" inputmode="numeric" pattern="\d{6}" maxlength="6" autocomplete="off" required title="6 digits">
+      <input type="text" id="rcode" inputmode="numeric" placeholder="42-381920" maxlength="20" autocomplete="off" required>
       <details>
         <summary class="muted">Sender not found?</summary>
         <label for="host">Sender's address (shown under its code)</label>
@@ -98,7 +98,7 @@ async function put(f) {
     $('share').hidden = false;
     armExpiry();
   }
-  return fetch(`/api/share/${code}?name=${encodeURIComponent(f.name)}`, { method: 'PUT', body: f });
+  return fetch(`/api/share/${code.slice(-6)}?name=${encodeURIComponent(f.name)}`, { method: 'PUT', body: f });
 }
 async function share(files) {
   const failed = [];
@@ -128,11 +128,12 @@ $('pick').onchange = e => { share([...e.target.files]); e.target.value = ''; };
 // --- Receive ---
 $('find').onsubmit = async e => {
   e.preventDefault();
-  const rc = $('rcode').value, host = $('host').value.trim();
+  const digits = $('rcode').value.replace(/\D/g, ''), host = $('host').value.trim(); // the dash is optional
   $('result').hidden = true;
+  if (!/^\d{7,16}$/.test(digits)) return say($('recv-msg'), 'Type the whole code shown on the sender, like 42-381920.', true);
   say($('recv-msg'), 'Looking for the sender…');
   try {
-    const r = await fetch(`/api/find/${rc}` + (host ? `?host=${encodeURIComponent(host)}` : ''));
+    const r = await fetch(`/api/find/${digits}` + (host ? `?host=${encodeURIComponent(host)}` : ''));
     const d = await r.json();
     if (!r.ok) throw new Error(d.error);
     $('files').replaceChildren(...d.files.map(f => {
@@ -140,7 +141,7 @@ $('find').onsubmit = async e => {
       cb.type = 'checkbox';
       cb.checked = true;
       cb.setAttribute('aria-label', 'Select ' + f.name);
-      a.href = `http://${d.host}/dl/${rc}/${f.i}`;
+      a.href = `http://${d.host}/dl/${digits.slice(-6)}/${f.i}`;
       a.textContent = f.name;
       li.append(cb, a, ` (${size(f.size)})`);
       return li;
